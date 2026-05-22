@@ -10,8 +10,10 @@ ROOT = Path(__file__).resolve().parent
 
 def main():
     name = "oi-ftp"
-    if platform.system().lower().startswith("win"):
+    is_windows = platform.system().lower().startswith("win")
+    if is_windows:
         name += ".exe"
+    data_sep = ";" if is_windows else ":"
     cmd = [
         sys.executable,
         "-m",
@@ -19,6 +21,8 @@ def main():
         "--onefile",
         "--name",
         "oi-ftp",
+        "--add-data",
+        f"{ROOT / 'static'}{data_sep}static",
         str(ROOT / "server.py"),
     ]
     print("将执行：", " ".join(cmd))

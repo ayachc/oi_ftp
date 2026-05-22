@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import io
 import json
 import mimetypes
-import os
 import posixpath
 import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -19,7 +18,9 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+ASSET_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+STATIC_INDEX = ASSET_ROOT / "static" / "index.html"
 DATA_DIR = ROOT / "ftp_data"
 DOWNLOAD_DIR = DATA_DIR / "download"
 UPLOAD_DIR = DATA_DIR / "upload"
@@ -134,6 +135,21 @@ def remove_meta_for_path(meta, area, rel):
             del meta[key]
 
 
+def remove_meta_for_area(meta, area):
+    prefix = f"{area}:"
+    for key in list(meta):
+        if key.startswith(prefix):
+            del meta[key]
+
+
+def clear_directory(path):
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def is_owned_by(meta, client_id, area, rel, target):
     if not client_id:
         return False
@@ -210,7 +226,7 @@ def parse_multipart(handler):
 
 
 def html_page():
-    return HTML
+    return STATIC_INDEX.read_bytes()
 
 
 class FileServiceHandler(BaseHTTPRequestHandler):
@@ -263,7 +279,7 @@ class FileServiceHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         client_id, is_admin, new_client = self.identity()
         if parsed.path == "/":
-            body = html_page().encode("utf-8")
+            body = html_page()
             self.send_headers(200, "text/html; charset=utf-8", {"Content-Length": str(len(body))}, new_client)
             self.wfile.write(body)
             return
@@ -387,6 +403,17 @@ class FileServiceHandler(BaseHTTPRequestHandler):
                 save_meta(meta)
             self.json({"ok": True}, new_client=new_client)
             return
+        if parsed.path == "/api/clear-uploads":
+            if not is_admin:
+                self.error_json("需要管理员权限", 403, new_client)
+                return
+            with STATE_LOCK:
+                clear_directory(UPLOAD_DIR)
+                meta = load_meta()
+                remove_meta_for_area(meta, "upload")
+                save_meta(meta)
+            self.json({"ok": True}, new_client=new_client)
+            return
         if parsed.path == "/api/upload":
             qs = urllib.parse.parse_qs(parsed.query)
             area = qs.get("area", [""])[0]
@@ -411,6 +438,9 @@ class FileServiceHandler(BaseHTTPRequestHandler):
             if not files:
                 self.error_json("没有收到文件", 400, new_client)
                 return
+            if area == "download" and len(files) != 1:
+                self.error_json("左侧下载列表只能上传单个文件", 400, new_client)
+                return
             if total > limit:
                 self.error_json(f"上传内容超过 {cfg['file_size_limit_mb']} MB 限制", 413, new_client)
                 return
@@ -419,6 +449,9 @@ class FileServiceHandler(BaseHTTPRequestHandler):
             with STATE_LOCK:
                 meta = load_meta()
                 for filename, payload in files:
+                    if area == "download" and ("/" in filename or "\\" in filename):
+                        self.error_json("左侧下载列表只能上传单个文件", 400, new_client)
+                        return
                     rel = clean_rel_path(filename, allow_nested=(area == "upload"))
                     target, final_rel = unique_path(base, rel)
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -435,507 +468,6 @@ class FileServiceHandler(BaseHTTPRequestHandler):
             self.json({"ok": True, "saved": saved}, new_client=new_client)
             return
         self.error_json("接口不存在", 404, new_client)
-
-
-HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>文件收发</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f4f7f5;
-      --ink: #17211b;
-      --muted: #65736b;
-      --line: #dbe4de;
-      --panel: #ffffff;
-      --teal: #007f73;
-      --teal-soft: #e2f5f1;
-      --amber: #b56a00;
-      --red: #c7362f;
-      --shadow: 0 18px 45px rgba(23, 33, 27, .08);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
-      background: linear-gradient(180deg, #eef7f1 0%, var(--bg) 38%, #f8faf8 100%);
-      color: var(--ink);
-    }
-    button, input { font: inherit; }
-    .app {
-      max-width: 1360px;
-      margin: 0 auto;
-      padding: 22px 18px 28px;
-    }
-    header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 18px;
-      margin-bottom: 16px;
-    }
-    h1 {
-      margin: 0 0 6px;
-      font-size: clamp(24px, 4vw, 38px);
-      letter-spacing: 0;
-    }
-    .sub {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.6;
-    }
-    .gear {
-      width: 44px;
-      height: 44px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #fff;
-      cursor: pointer;
-      box-shadow: var(--shadow);
-      font-size: 22px;
-    }
-    .gear.admin { color: #fff; background: var(--teal); border-color: var(--teal); }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 20px;
-    }
-    .panel {
-      background: rgba(255, 255, 255, .92);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      box-shadow: var(--shadow);
-      min-height: calc(100vh - 150px);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .panel.dragover {
-      border-color: var(--teal);
-      box-shadow: 0 0 0 4px var(--teal-soft), var(--shadow);
-    }
-    .panel-head {
-      padding: 16px;
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      border-bottom: 1px solid var(--line);
-    }
-    h2 {
-      margin: 0 0 4px;
-      font-size: 19px;
-      letter-spacing: 0;
-    }
-    .hint {
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .tools { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-    .btn {
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      min-height: 34px;
-      padding: 0 12px;
-      border-radius: 9px;
-      cursor: pointer;
-      transition: .16s ease;
-      white-space: nowrap;
-    }
-    .btn.primary { background: var(--teal); border-color: var(--teal); color: #fff; }
-    .btn.warn { color: var(--amber); }
-    .btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(23, 33, 27, .1); }
-    .btn:disabled {
-      opacity: .38;
-      cursor: not-allowed;
-      transform: none;
-      box-shadow: none;
-    }
-    .list {
-      flex: 1;
-      overflow: auto;
-      padding: 10px;
-    }
-    .row {
-      width: 100%;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto 42px;
-      align-items: center;
-      gap: 10px;
-      border: 1px solid transparent;
-      border-radius: 10px;
-      padding: 11px 10px;
-      min-height: 54px;
-      transition: .14s ease;
-    }
-    .row.downloadable { cursor: pointer; }
-    .row:hover {
-      background: #f1f8f5;
-      border-color: #d2e7de;
-    }
-    .name {
-      min-width: 0;
-      display: flex;
-      align-items: center;
-      gap: 9px;
-      font-weight: 650;
-    }
-    .name-text {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .meta {
-      color: var(--muted);
-      font-size: 13px;
-      white-space: nowrap;
-    }
-    .del {
-      height: 30px;
-      border-radius: 8px;
-      border: 1px solid #f0c7c4;
-      color: var(--red);
-      background: #fff8f7;
-      cursor: pointer;
-    }
-    .del:disabled {
-      opacity: .3;
-      cursor: not-allowed;
-      filter: grayscale(1);
-    }
-    .empty {
-      color: var(--muted);
-      height: 100%;
-      display: grid;
-      place-items: center;
-      text-align: center;
-      padding: 35px;
-      line-height: 1.7;
-    }
-    .status {
-      min-height: 28px;
-      margin-top: 14px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .modal {
-      position: fixed;
-      inset: 0;
-      background: rgba(13, 20, 17, .34);
-      display: none;
-      place-items: center;
-      padding: 20px;
-    }
-    .modal.show { display: grid; }
-    .dialog {
-      width: min(390px, 100%);
-      background: #fff;
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      box-shadow: var(--shadow);
-      padding: 18px;
-    }
-    .dialog h3 { margin: 0 0 12px; font-size: 20px; }
-    .dialog input {
-      width: 100%;
-      height: 42px;
-      border: 1px solid var(--line);
-      border-radius: 9px;
-      padding: 0 11px;
-      margin-bottom: 12px;
-    }
-    .dialog-actions { display: flex; gap: 8px; justify-content: flex-end; }
-    @media (max-width: 820px) {
-      .app { padding: 16px 10px 22px; }
-      .grid { grid-template-columns: 1fr; }
-      .panel { min-height: 460px; }
-      .row { grid-template-columns: minmax(0, 1fr) 42px; }
-      .row .meta { display: none; }
-      header { align-items: flex-start; }
-    }
-  </style>
-</head>
-<body>
-  <div class="app">
-    <header>
-      <div>
-        <h1>文件收发</h1>
-        <p class="sub" id="serverHint">连接同一局域网后，在浏览器打开本机 IP 和端口即可使用。</p>
-      </div>
-      <button class="gear" id="adminBtn" title="管理员模式">⚙</button>
-    </header>
-
-    <main class="grid">
-      <section class="panel" id="downloadPanel">
-        <div class="panel-head">
-          <div>
-            <h2>文件下载</h2>
-            <div class="hint">管理员上传文件，其他用户点击文件名下载</div>
-          </div>
-          <div class="tools">
-            <button class="btn primary" id="downloadUploadBtn">上传</button>
-          </div>
-        </div>
-        <div class="list" id="downloadList"></div>
-      </section>
-
-      <section class="panel" id="uploadPanel">
-        <div class="panel-head">
-          <div>
-            <h2>文件上传</h2>
-            <div class="hint">可拖入文件或文件夹，保留目录结构</div>
-          </div>
-          <div class="tools">
-            <button class="btn" id="uploadFileBtn">文件</button>
-            <button class="btn primary" id="uploadFolderBtn">文件夹</button>
-            <button class="btn warn" id="downloadAllBtn">下载</button>
-          </div>
-        </div>
-        <div class="list" id="uploadList"></div>
-      </section>
-    </main>
-    <div class="status" id="status"></div>
-  </div>
-
-  <input id="downloadInput" type="file" hidden>
-  <input id="uploadFileInput" type="file" multiple hidden>
-  <input id="uploadFolderInput" type="file" webkitdirectory directory multiple hidden>
-
-  <div class="modal" id="modal">
-    <div class="dialog">
-      <h3 id="modalTitle">管理员登录</h3>
-      <input id="passwordInput" type="password" placeholder="输入管理员密码" autocomplete="current-password">
-      <div class="dialog-actions">
-        <button class="btn" id="cancelLogin">取消</button>
-        <button class="btn primary" id="confirmLogin">登录</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const state = { isAdmin: false, limitMB: 5, download: [], upload: [] };
-    const $ = (id) => document.getElementById(id);
-    const statusEl = $("status");
-
-    function setStatus(text, error = false) {
-      statusEl.textContent = text || "";
-      statusEl.style.color = error ? "#c7362f" : "#65736b";
-    }
-    function formatSize(bytes) {
-      if (bytes < 1024) return bytes + " B";
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-      return (bytes / 1024 / 1024).toFixed(2) + " MB";
-    }
-    function icon(kind) { return kind === "folder" ? "📁" : "📄"; }
-    async function api(url, options) {
-      const res = await fetch(url, options);
-      const type = res.headers.get("Content-Type") || "";
-      if (type.includes("application/json")) {
-        const data = await res.json();
-        if (!res.ok || data.ok === false) throw new Error(data.error || "操作失败");
-        return data;
-      }
-      if (!res.ok) throw new Error("操作失败");
-      return res;
-    }
-    async function refresh() {
-      const data = await api("/api/state");
-      state.isAdmin = data.is_admin;
-      state.limitMB = data.file_size_limit_mb;
-      state.download = data.download;
-      state.upload = data.upload;
-      render();
-    }
-    function renderList(area, items) {
-      const list = $(area + "List");
-      list.innerHTML = "";
-      if (!items.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = area === "download" ? "暂无可下载文件" : "暂无上传内容，拖入文件或文件夹即可上传";
-        list.appendChild(empty);
-        return;
-      }
-      for (const item of items) {
-        const row = document.createElement("div");
-        row.className = "row" + (area === "download" ? " downloadable" : "");
-        row.title = area === "download" ? "点击下载" : item.name;
-        row.innerHTML = `
-          <div class="name"><span>${icon(item.kind)}</span><span class="name-text"></span></div>
-          <div class="meta">${item.uploaded_at}</div>
-          <div class="meta">${formatSize(item.size)}</div>
-          <button class="del" title="删除">del</button>
-        `;
-        row.querySelector(".name-text").textContent = item.name;
-        if (area === "download") {
-          row.addEventListener("click", (ev) => {
-            if (ev.target.closest("button")) return;
-            window.location.href = "/api/download?path=" + encodeURIComponent(item.path);
-          });
-        }
-        const del = row.querySelector(".del");
-        del.disabled = !item.can_delete;
-        del.addEventListener("click", async (ev) => {
-          ev.stopPropagation();
-          if (!item.can_delete) return;
-          if (!confirm("确定删除 " + item.name + " 吗？")) return;
-          try {
-            await api("/api/delete", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ area, path: item.path })
-            });
-            setStatus("已删除：" + item.name);
-            await refresh();
-          } catch (err) {
-            setStatus(err.message, true);
-          }
-        });
-        list.appendChild(row);
-      }
-    }
-    function render() {
-      $("adminBtn").classList.toggle("admin", state.isAdmin);
-      $("adminBtn").title = state.isAdmin ? "已进入管理员模式，点击退出" : "管理员模式";
-      $("downloadUploadBtn").disabled = !state.isAdmin;
-      $("downloadAllBtn").disabled = !state.isAdmin;
-      renderList("download", state.download);
-      renderList("upload", state.upload);
-    }
-    function totalSize(files) {
-      return files.reduce((sum, f) => sum + f.size, 0);
-    }
-    function appendFiles(form, files) {
-      for (const file of files) {
-        const rel = file.relativePath || file.webkitRelativePath || file.name;
-        form.append("files", file, rel);
-      }
-    }
-    async function uploadFiles(area, files) {
-      if (!files.length) return;
-      const total = totalSize(files);
-      if (total > state.limitMB * 1024 * 1024) {
-        setStatus(`上传内容超过 ${state.limitMB} MB 限制`, true);
-        return;
-      }
-      const form = new FormData();
-      appendFiles(form, files);
-      setStatus("正在上传 " + files.length + " 个文件...");
-      try {
-        await api("/api/upload?area=" + area, { method: "POST", body: form });
-        setStatus("上传完成");
-        await refresh();
-      } catch (err) {
-        setStatus(err.message, true);
-      }
-    }
-    async function readEntry(entry, prefix = "") {
-      if (entry.isFile) {
-        return new Promise((resolve, reject) => {
-          entry.file((file) => {
-            file.relativePath = prefix + file.name;
-            resolve([file]);
-          }, reject);
-        });
-      }
-      if (entry.isDirectory) {
-        const reader = entry.createReader();
-        const all = [];
-        async function readBatch() {
-          const entries = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
-          if (!entries.length) return;
-          for (const child of entries) {
-            all.push(...await readEntry(child, prefix + entry.name + "/"));
-          }
-          await readBatch();
-        }
-        await readBatch();
-        return all;
-      }
-      return [];
-    }
-    async function filesFromDrop(ev) {
-      const items = [...ev.dataTransfer.items || []];
-      if (items.length && items[0].webkitGetAsEntry) {
-        const files = [];
-        for (const item of items) {
-          const entry = item.webkitGetAsEntry();
-          if (entry) files.push(...await readEntry(entry));
-        }
-        return files;
-      }
-      return [...ev.dataTransfer.files || []];
-    }
-    $("downloadUploadBtn").addEventListener("click", () => {
-      if (state.isAdmin) $("downloadInput").click();
-    });
-    $("downloadInput").addEventListener("change", (ev) => uploadFiles("download", [...ev.target.files]).then(() => ev.target.value = ""));
-    $("uploadFileBtn").addEventListener("click", () => $("uploadFileInput").click());
-    $("uploadFolderBtn").addEventListener("click", () => $("uploadFolderInput").click());
-    $("uploadFileInput").addEventListener("change", (ev) => uploadFiles("upload", [...ev.target.files]).then(() => ev.target.value = ""));
-    $("uploadFolderInput").addEventListener("change", (ev) => uploadFiles("upload", [...ev.target.files]).then(() => ev.target.value = ""));
-    $("downloadAllBtn").addEventListener("click", () => {
-      if (state.isAdmin) window.location.href = "/api/download-uploads";
-    });
-    $("adminBtn").addEventListener("click", async () => {
-      if (state.isAdmin) {
-        await api("/api/logout", { method: "POST" });
-        setStatus("已退出管理员模式");
-        await refresh();
-        return;
-      }
-      $("modal").classList.add("show");
-      $("passwordInput").focus();
-    });
-    $("cancelLogin").addEventListener("click", () => $("modal").classList.remove("show"));
-    $("confirmLogin").addEventListener("click", async () => {
-      try {
-        await api("/api/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: $("passwordInput").value })
-        });
-        $("passwordInput").value = "";
-        $("modal").classList.remove("show");
-        setStatus("已进入管理员模式");
-        await refresh();
-      } catch (err) {
-        setStatus(err.message, true);
-      }
-    });
-    $("passwordInput").addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") $("confirmLogin").click();
-      if (ev.key === "Escape") $("modal").classList.remove("show");
-    });
-    const uploadPanel = $("uploadPanel");
-    ["dragenter", "dragover"].forEach(name => uploadPanel.addEventListener(name, (ev) => {
-      ev.preventDefault();
-      uploadPanel.classList.add("dragover");
-    }));
-    ["dragleave", "drop"].forEach(name => uploadPanel.addEventListener(name, (ev) => {
-      ev.preventDefault();
-      if (name === "drop") return;
-      uploadPanel.classList.remove("dragover");
-    }));
-    uploadPanel.addEventListener("drop", async (ev) => {
-      uploadPanel.classList.remove("dragover");
-      try {
-        const files = await filesFromDrop(ev);
-        await uploadFiles("upload", files);
-      } catch (err) {
-        setStatus("浏览器未能读取拖入的文件夹", true);
-      }
-    });
-    refresh().catch(err => setStatus(err.message, true));
-  </script>
-</body>
-</html>
-"""
 
 
 def find_lan_ips():

@@ -3,3 +3,5 @@ __pycache__/
 ftp_data/
 md.md
 plan.md
+.codex
+.agents
