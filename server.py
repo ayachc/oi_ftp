@@ -3,8 +3,11 @@ import argparse
 import json
 import mimetypes
 import posixpath
+import re
 import secrets
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -30,6 +33,8 @@ META_FILE = DATA_DIR / "metadata.json"
 DEFAULT_CONFIG = {
     "admin_password": "admin123",
     "file_size_limit_mb": 5,
+    "port": 5000,
+    "local_ips": [],
 }
 
 STATE_LOCK = threading.RLock()
@@ -57,6 +62,28 @@ def load_config():
         cfg["file_size_limit_mb"] = max(1, int(cfg["file_size_limit_mb"]))
     except (TypeError, ValueError):
         cfg["file_size_limit_mb"] = DEFAULT_CONFIG["file_size_limit_mb"]
+    try:
+        port = int(cfg["port"])
+        cfg["port"] = port if 1 <= port <= 65535 else DEFAULT_CONFIG["port"]
+    except (TypeError, ValueError):
+        cfg["port"] = DEFAULT_CONFIG["port"]
+    if not isinstance(cfg["local_ips"], list):
+        cfg["local_ips"] = []
+    return cfg
+
+
+def save_config(config):
+    tmp = CONFIG_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(CONFIG_FILE)
+
+
+def prepare_runtime_config(cli_port=None):
+    cfg = load_config()
+    if cli_port is not None:
+        cfg["port"] = cli_port
+    cfg["local_ips"] = find_lan_ips()
+    save_config(cfg)
     return cfg
 
 
@@ -485,23 +512,53 @@ class FileServiceHandler(BaseHTTPRequestHandler):
 
 
 def find_lan_ips():
-    import socket
     ips = []
+
+    def add(ip):
+        if not ip or ip in ips:
+            return
+        if ip.startswith(("127.", "0.", "169.254.")):
+            return
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return
+        try:
+            if any(not 0 <= int(part) <= 255 for part in parts):
+                return
+        except ValueError:
+            return
+        ips.append(ip)
+
     hostname = socket.gethostname()
     try:
         for item in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            ip = item[4][0]
-            if not ip.startswith("127.") and ip not in ips:
-                ips.append(ip)
+            add(item[4][0])
     except socket.gaierror:
         pass
+    for target in ("8.8.8.8", "1.1.1.1", "223.5.5.5"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect((target, 80))
+                add(sock.getsockname()[0])
+        except OSError:
+            pass
+    commands = [
+        (["hostname", "-I"], r"\b([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b"),
+        (["ip", "-o", "-4", "addr", "show", "scope", "global"], r"\binet\s+([0-9.]+)/"),
+        (["ifconfig"], r"\binet\s(?:addr:)?([0-9.]+)"),
+        (["ipconfig"], r"IPv4[^\r\n:]*:\s*([0-9.]+)"),
+    ]
+    for cmd, pattern in commands:
+        try:
+            output = subprocess.run(cmd, capture_output=True, text=True, timeout=2, check=False).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for ip in re.findall(pattern, output):
+            add(ip)
+    fib_trie = Path("/proc/net/fib_trie")
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(("8.8.8.8", 80))
-        ip = sock.getsockname()[0]
-        if ip not in ips:
-            ips.append(ip)
-        sock.close()
+        for ip in re.findall(r"\|--\s*([0-9.]+)\s*\n\s*/32 host LOCAL", fib_trie.read_text()):
+            add(ip)
     except OSError:
         pass
     return ips
@@ -510,15 +567,20 @@ def find_lan_ips():
 def main():
     parser = argparse.ArgumentParser(description="轻量文件收发 Web 服务")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0")
-    parser.add_argument("--port", default=5000, type=int, help="监听端口，默认 5000")
+    parser.add_argument("--port", default=None, type=int, help="监听端口；未指定时读取 config.json，仍没有则默认 5000")
     args = parser.parse_args()
+    if args.port is not None and not 1 <= args.port <= 65535:
+        parser.error("--port 必须在 1 到 65535 之间")
     ensure_data_dirs()
-    server = ThreadingHTTPServer((args.host, args.port), FileServiceHandler)
+    cfg = prepare_runtime_config(args.port)
+    port = cfg["port"]
+    server = ThreadingHTTPServer((args.host, port), FileServiceHandler)
     print("文件收发服务已启动")
-    print(f"本机访问：http://127.0.0.1:{args.port}")
-    for ip in find_lan_ips():
-        print(f"局域网访问：http://{ip}:{args.port}")
+    print(f"本机访问：http://127.0.0.1:{port}")
+    for ip in cfg["local_ips"]:
+        print(f"局域网访问：http://{ip}:{port}")
     print(f"数据目录：{DATA_DIR}")
+    print(f"配置文件：{CONFIG_FILE}")
     print("按 Ctrl+C 停止服务")
     try:
         server.serve_forever()
