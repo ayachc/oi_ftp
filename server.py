@@ -226,7 +226,10 @@ def parse_multipart(handler):
 
 
 def html_page():
-    return STATIC_INDEX.read_bytes()
+    try:
+        return STATIC_INDEX.read_bytes()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"静态页面不存在：{STATIC_INDEX}") from exc
 
 
 class FileServiceHandler(BaseHTTPRequestHandler):
@@ -279,7 +282,18 @@ class FileServiceHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         client_id, is_admin, new_client = self.identity()
         if parsed.path == "/":
-            body = html_page()
+            try:
+                body = html_page()
+            except RuntimeError as exc:
+                body = str(exc).encode("utf-8")
+                self.send_headers(
+                    500,
+                    "text/plain; charset=utf-8",
+                    {"Content-Length": str(len(body))},
+                    new_client,
+                )
+                self.wfile.write(body)
+                return
             self.send_headers(200, "text/html; charset=utf-8", {"Content-Length": str(len(body))}, new_client)
             self.wfile.write(body)
             return
@@ -496,7 +510,7 @@ def find_lan_ips():
 def main():
     parser = argparse.ArgumentParser(description="轻量文件收发 Web 服务")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0")
-    parser.add_argument("--port", default=8080, type=int, help="监听端口，默认 8080")
+    parser.add_argument("--port", default=5000, type=int, help="监听端口，默认 5000")
     args = parser.parse_args()
     ensure_data_dirs()
     server = ThreadingHTTPServer((args.host, args.port), FileServiceHandler)

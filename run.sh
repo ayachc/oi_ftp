@@ -1,3 +1,3 @@
 #!/usr/bin/env sh
 cd "$(dirname "$0")" || exit 1
-python3 server.py --port 8080
+python3 server.py --port 5000
