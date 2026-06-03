@@ -48,6 +48,7 @@ python server.py --port 8080
   "admin_password": "admin123",
   "file_size_limit_mb": 5,
   "port": 5000,
+  "heartbeat_interval_seconds": 3,
   "local_ips": [
     "192.168.1.8",
     "10.0.0.5"
@@ -55,7 +56,9 @@ python server.py --port 8080
 }
 ```
 
-其中 `local_ips` 会在服务启动时自动检测并写入。如果电脑同时连接多个局域网，检测到的地址会全部列出。
+其中 `heartbeat_interval_seconds` 是在线统计心跳间隔，`local_ips` 会在服务启动时自动检测并写入。如果电脑同时连接多个局域网，检测到的地址会全部列出。
+
+在线统计优先使用 WebSocket 长连接维护在线状态，避免浏览器后台节流导致 `setInterval` 心跳不准；如果 WebSocket 不可用，会自动退回 HTTP 心跳。
 
 ## 打包为单文件
 

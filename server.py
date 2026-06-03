@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import hashlib
 import json
 import mimetypes
 import posixpath
 import re
+import struct
 import secrets
 import shutil
 import socket
@@ -35,10 +38,14 @@ DEFAULT_CONFIG = {
     "file_size_limit_mb": 5,
     "port": 5000,
     "local_ips": [],
+    "heartbeat_interval_seconds": 3,
 }
 
 STATE_LOCK = threading.RLock()
 ADMIN_SESSIONS = set()
+ONLINE_USERS = {}
+KICKED_USERS = set()
+OFFLINE_HISTORY_DEBOUNCE_SECONDS = 30
 
 
 def ensure_data_dirs():
@@ -69,6 +76,10 @@ def load_config():
         cfg["port"] = DEFAULT_CONFIG["port"]
     if not isinstance(cfg["local_ips"], list):
         cfg["local_ips"] = []
+    try:
+        cfg["heartbeat_interval_seconds"] = max(1, int(cfg["heartbeat_interval_seconds"]))
+    except (TypeError, ValueError):
+        cfg["heartbeat_interval_seconds"] = DEFAULT_CONFIG["heartbeat_interval_seconds"]
     return cfg
 
 
@@ -103,6 +114,10 @@ def save_meta(meta):
 
 def now_text(ts=None):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts or time.time()))
+
+
+def datetime_text(ts=None):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts or time.time()))
 
 
 def file_size(path):
@@ -259,6 +274,160 @@ def html_page():
         raise RuntimeError(f"静态页面不存在：{STATIC_INDEX}") from exc
 
 
+def read_json_body(handler):
+    length = int(handler.headers.get("Content-Length", "0") or 0)
+    if length <= 0:
+        return {}
+    return json.loads(handler.rfile.read(length).decode("utf-8") or "{}")
+
+
+def validate_display_name(name):
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("名字不能为空")
+    if len(name) > 20:
+        raise ValueError("名字最多 20 个字符")
+    return name
+
+
+def online_thresholds():
+    interval = load_config()["heartbeat_interval_seconds"]
+    return interval, interval * 3, interval * 9
+
+
+def online_status(user, now=None):
+    now = now or time.time()
+    _, lag_seconds, offline_seconds = online_thresholds()
+    age = now - user["last_seen"]
+    if age >= offline_seconds:
+        return "offline"
+    if age >= lag_seconds:
+        return "lagging"
+    return "online"
+
+
+def close_short_offline_gap(user, now):
+    gap = now - user["last_seen"]
+    if gap < OFFLINE_HISTORY_DEBOUNCE_SECONDS:
+        return
+    offline_start = user["last_seen"]
+    history = user["history"]
+    if history and history[-1]["status"] == "online" and history[-1].get("end") is None:
+        history[-1]["end"] = offline_start
+    history.append({"status": "offline", "start": offline_start, "end": now})
+    history.append({"status": "online", "start": now, "end": None})
+
+
+def online_history_view(user, now=None):
+    now = now or time.time()
+    history = [dict(item) for item in user["history"]]
+    if now - user["last_seen"] >= OFFLINE_HISTORY_DEBOUNCE_SECONDS:
+        if history and history[-1]["status"] == "online" and history[-1].get("end") is None:
+            history[-1]["end"] = user["last_seen"]
+            history.append({"status": "offline", "start": user["last_seen"], "end": None})
+        elif history and history[-1]["status"] == "offline":
+            history[-1]["end"] = None
+    return [
+        {
+            "status": item["status"],
+            "start": datetime_text(item["start"]),
+            "end": datetime_text(item["end"]) if item.get("end") else None,
+        }
+        for item in history
+    ]
+
+
+def online_user_view(user, include_history=False, now=None):
+    now = now or time.time()
+    data = {
+        "id": user["id"],
+        "name": user["name"],
+        "status": online_status(user, now),
+        "last_seen": datetime_text(user["last_seen"]),
+    }
+    if include_history:
+        data["history"] = online_history_view(user, now)
+    return data
+
+
+def online_state(client_id, is_admin):
+    now = time.time()
+    interval = load_config()["heartbeat_interval_seconds"]
+    users = [
+        online_user_view(user, now=now)
+        for user in sorted(ONLINE_USERS.values(), key=lambda item: item["name"].lower())
+    ]
+    return {
+        "ok": True,
+        "is_admin": is_admin,
+        "heartbeat_interval_seconds": interval,
+        "registered": client_id in ONLINE_USERS,
+        "self": online_user_view(ONLINE_USERS[client_id], include_history=True, now=now) if client_id in ONLINE_USERS else None,
+        "users": users,
+    }
+
+
+def websocket_accept_key(key):
+    digest = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def websocket_send(conn, opcode, payload=b""):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    length = len(payload)
+    header = bytearray([0x80 | opcode])
+    if length < 126:
+        header.append(length)
+    elif length < 65536:
+        header.extend([126])
+        header.extend(struct.pack("!H", length))
+    else:
+        header.extend([127])
+        header.extend(struct.pack("!Q", length))
+    conn.sendall(bytes(header) + payload)
+
+
+def websocket_read_exact(conn, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
+def websocket_read_frame(conn, timeout):
+    conn.settimeout(timeout)
+    try:
+        head = websocket_read_exact(conn, 2)
+        if not head:
+            return None
+        opcode = head[0] & 0x0F
+        masked = bool(head[1] & 0x80)
+        length = head[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", websocket_read_exact(conn, 2) or b"\x00\x00")[0]
+        elif length == 127:
+            length = struct.unpack("!Q", websocket_read_exact(conn, 8) or b"\x00" * 8)[0]
+        mask = websocket_read_exact(conn, 4) if masked else b""
+        payload = websocket_read_exact(conn, length) if length else b""
+        if payload is None:
+            return None
+        if masked:
+            payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        return opcode, payload
+    except socket.timeout:
+        return "timeout"
+    except OSError:
+        return None
+
+
+def websocket_reject_payload(message):
+    return json.dumps({"ok": False, "rejected": True, "error": message}, ensure_ascii=False)
+
+
 class FileServiceHandler(BaseHTTPRequestHandler):
     server_version = "OIFileService/1.0"
 
@@ -304,10 +473,63 @@ class FileServiceHandler(BaseHTTPRequestHandler):
     def error_json(self, message, status=400, new_client=None):
         self.json({"ok": False, "error": message}, status=status, new_client=new_client)
 
+    def handle_online_websocket(self, client_id, new_client=None):
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self.error_json("缺少 WebSocket 握手信息", 400, new_client)
+            return
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
+        if new_client:
+            self.send_header("Set-Cookie", f"client_id={new_client}; Path=/; SameSite=Lax; Max-Age=31536000")
+        self.end_headers()
+
+        conn = self.connection
+        interval = load_config()["heartbeat_interval_seconds"]
+        try:
+            while True:
+                with STATE_LOCK:
+                    if client_id in KICKED_USERS:
+                        websocket_send(conn, 0x1, websocket_reject_payload("登记已被管理员删除"))
+                        websocket_send(conn, 0x8)
+                        return
+                    user = ONLINE_USERS.get(client_id)
+                    if not user:
+                        websocket_send(conn, 0x1, websocket_reject_payload("尚未登记"))
+                        websocket_send(conn, 0x8)
+                        return
+                    now = time.time()
+                    close_short_offline_gap(user, now)
+                    user["last_seen"] = now
+                    websocket_send(conn, 0x1, json.dumps({"ok": True, "type": "online", "last_seen": datetime_text(now)}, ensure_ascii=False))
+                websocket_send(conn, 0x9, b"")
+                deadline = time.time() + interval
+                while time.time() < deadline:
+                    frame = websocket_read_frame(conn, max(0.2, min(1.0, deadline - time.time())))
+                    if frame == "timeout":
+                        continue
+                    if frame is None:
+                        return
+                    opcode, payload = frame
+                    if opcode == 0x8:
+                        websocket_send(conn, 0x8, payload)
+                        return
+                    if opcode == 0x9:
+                        websocket_send(conn, 0xA, payload)
+        except OSError:
+            return
+        finally:
+            self.close_connection = True
+
     def do_GET(self):
         ensure_data_dirs()
         parsed = urllib.parse.urlparse(self.path)
         client_id, is_admin, new_client = self.identity()
+        if parsed.path == "/api/online-ws":
+            self.handle_online_websocket(client_id, new_client)
+            return
         if parsed.path == "/":
             try:
                 body = html_page()
@@ -331,9 +553,26 @@ class FileServiceHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "is_admin": is_admin,
                     "file_size_limit_mb": cfg["file_size_limit_mb"],
+                    "heartbeat_interval_seconds": cfg["heartbeat_interval_seconds"],
                     "download": list_area("download", client_id, is_admin),
                     "upload": list_area("upload", client_id, is_admin),
                 }
+            self.json(payload, new_client=new_client)
+            return
+        if parsed.path == "/api/online-state":
+            with STATE_LOCK:
+                payload = online_state(client_id, is_admin)
+            self.json(payload, new_client=new_client)
+            return
+        if parsed.path == "/api/online-user":
+            qs = urllib.parse.parse_qs(parsed.query)
+            user_id = qs.get("id", [""])[0]
+            with STATE_LOCK:
+                user = ONLINE_USERS.get(user_id)
+                if not user:
+                    self.error_json("用户不存在", 404, new_client)
+                    return
+                payload = {"ok": True, "user": online_user_view(user, include_history=True)}
             self.json(payload, new_client=new_client)
             return
         if parsed.path == "/api/download":
@@ -413,6 +652,85 @@ class FileServiceHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", "admin_session=; Path=/; Max-Age=0")
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
+            return
+        if parsed.path == "/api/online-register":
+            try:
+                data = read_json_body(self)
+                name = validate_display_name(data.get("name"))
+            except (json.JSONDecodeError, ValueError) as exc:
+                self.error_json(str(exc), 400, new_client)
+                return
+            with STATE_LOCK:
+                for uid, user in ONLINE_USERS.items():
+                    if uid != client_id and user["name"] == name:
+                        self.error_json("名字不能重复", 409, new_client)
+                        return
+                now = time.time()
+                KICKED_USERS.discard(client_id)
+                if client_id in ONLINE_USERS:
+                    user = ONLINE_USERS[client_id]
+                    close_short_offline_gap(user, now)
+                    user["name"] = name
+                    user["last_seen"] = now
+                else:
+                    ONLINE_USERS[client_id] = {
+                        "id": client_id,
+                        "name": name,
+                        "last_seen": now,
+                        "history": [{"status": "online", "start": now, "end": None}],
+                    }
+                payload = {"ok": True, "user": online_user_view(ONLINE_USERS[client_id], include_history=True)}
+            self.json(payload, new_client=new_client)
+            return
+        if parsed.path == "/api/online-heartbeat":
+            try:
+                data = read_json_body(self)
+            except json.JSONDecodeError as exc:
+                self.error_json(str(exc), 400, new_client)
+                return
+            with STATE_LOCK:
+                if client_id in KICKED_USERS:
+                    self.json({"ok": False, "rejected": True, "error": "登记已被管理员删除"}, status=409, new_client=new_client)
+                    return
+                user = ONLINE_USERS.get(client_id)
+                if not user:
+                    self.json({"ok": False, "rejected": True, "error": "尚未登记"}, status=409, new_client=new_client)
+                    return
+                name = (data.get("name") or user["name"]).strip()
+                if name and name != user["name"]:
+                    try:
+                        name = validate_display_name(name)
+                    except ValueError as exc:
+                        self.error_json(str(exc), 400, new_client)
+                        return
+                    for uid, other in ONLINE_USERS.items():
+                        if uid != client_id and other["name"] == name:
+                            self.error_json("名字不能重复", 409, new_client)
+                            return
+                    user["name"] = name
+                now = time.time()
+                close_short_offline_gap(user, now)
+                user["last_seen"] = now
+                payload = {"ok": True, "user": online_user_view(user)}
+            self.json(payload, new_client=new_client)
+            return
+        if parsed.path == "/api/online-delete":
+            if not is_admin:
+                self.error_json("需要管理员权限", 403, new_client)
+                return
+            try:
+                data = read_json_body(self)
+            except json.JSONDecodeError as exc:
+                self.error_json(str(exc), 400, new_client)
+                return
+            user_id = data.get("id")
+            with STATE_LOCK:
+                if not user_id or user_id not in ONLINE_USERS:
+                    self.error_json("用户不存在", 404, new_client)
+                    return
+                del ONLINE_USERS[user_id]
+                KICKED_USERS.add(user_id)
+            self.json({"ok": True}, new_client=new_client)
             return
         if parsed.path == "/api/delete":
             length = int(self.headers.get("Content-Length", "0") or 0)
